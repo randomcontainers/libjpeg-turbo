@@ -1,3 +1,4 @@
 *
 !keys/libjpeg-turbo.gpg
+!runtime-deps.alpine
 !runtime-deps.ubuntu

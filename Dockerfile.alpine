@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+RUN apk add --no-cache gpgv
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz /src/
+ADD https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz.sig /src/
+# The libjpeg-turbo Project's signing key, fingerprint 0338 C8D8 D9FD A62C F9C4 21BD 7EC2 DBB6 F4DB F434
+COPY keys/libjpeg-turbo.gpg /tmp/libjpeg-turbo.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/libjpeg-turbo.gpg "libjpeg-turbo-${VERSION}.tar.gz.sig" "libjpeg-turbo-${VERSION}.tar.gz"; \
+    mkdir libjpeg-turbo; \
+    tar -xzf "libjpeg-turbo-${VERSION}.tar.gz" -C libjpeg-turbo --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
+# nasm assembles the x86-64 SIMD code; on arm64 the SIMD code is written with
+# compiler intrinsics.
+RUN apk add --no-cache \
+      build-base \
+      cmake \
+      nasm \
+      samurai \
+      scanelf \
+      zlib-dev
+COPY --link --from=source /src/libjpeg-turbo /src/libjpeg-turbo
+WORKDIR /src/libjpeg-turbo
+ARG JOBS
+# The tools are linked statically against the libjpeg and TurboJPEG libraries
+# built here, so they never load the distro's libjpeg. The prefix is needed
+# because upstream defaults to /opt/libjpeg-turbo. The tools print a build
+# date, taken from the release's files so that every build of a release
+# prints the same one. Upstream does not test on musl or on Linux arm64, so
+# the whole regression suite runs before anything is installed.
+RUN set -eu; \
+    SOURCE_DATE_EPOCH="$(stat -c %Y CMakeLists.txt)"; \
+    export SOURCE_DATE_EPOCH; \
+    set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DENABLE_SHARED=OFF \
+      -DENABLE_STATIC=ON \
+      -DREQUIRE_SIMD=ON \
+      -DWITH_SYSTEM_ZLIB=ON \
+      -DWITH_TESTS=ON \
+      -DWITH_TOOLS=ON \
+      -DWITH_TURBOJPEG=ON; \
+    cmake -S . -B build "$@" | tee /tmp/cmake.log; \
+    printf '%s\n' "$*" > /tmp/cmake-options; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    ctest --test-dir build --output-on-failure -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install build --component bin; \
+    test ! -e /out/usr/local/lib; \
+    test ! -e /out/usr/local/include; \
+    strip --strip-unneeded /out/usr/local/bin/*
+
+ARG BASE_IMAGE
+ARG VERSION
+# The tools may only load musl and zlib; zlib proves that the distro's zlib is
+# used instead of the copy in the tarball.
+# runtime-deps lists the so: names the tools need, minus the libraries built
+# here, plus the packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    bin=/out/usr/local/bin; \
+    for tool in cjpeg djpeg jpegtran rdjpgcom tjbench wrjpgcom; do test -x "$bin/$tool"; done; \
+    "$bin/cjpeg" -version 2> /tmp/cjpeg-version; \
+    grep -Fq "libjpeg-turbo version ${VERSION} (build " /tmp/cjpeg-version; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    if grep -Ev -e '^$' -e '^libc\.musl-[a-z0-9_]+\.so\.1$' -e '^libz\.so\.1$' /tmp/needed; then \
+      echo "the tools load more than musl and zlib" >&2; \
+      exit 1; \
+    fi; \
+    grep -Fqx libz.so.1 /tmp/needed; \
+    meta=/out/usr/local/share/randomcontainers/libjpeg-turbo; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.md README.ijg src/spng/libpng-LICENSE.txt "$meta/licenses/"; \
+    cp src/spng/LICENSE "$meta/licenses/spng-LICENSE"; \
+    awk '{ print } /\*\// { exit }' simd/jsimd.h > "$meta/licenses/simd-NOTICE"; \
+    grep -q 'Permission is granted to anyone' "$meta/licenses/simd-NOTICE"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz" \
+      "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz.sig" \
+      "https://github.com/randomcontainers/libjpeg-turbo/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "cmake: $(cmake --version | head -n 1)"; \
+      echo "options: $(cat /tmp/cmake-options)"; \
+      sed -n 's/^-- \(SIMD extensions: .*\)$/\1/p' /tmp/cmake.log; \
+      cat /tmp/cjpeg-version; \
+    } > "$meta/buildinfo"; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /usr/local/share/randomcontainers/libjpeg-turbo/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "jpegtran"]
+CMD ["-version"]
