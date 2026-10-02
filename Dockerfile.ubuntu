@@ -1,0 +1,133 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gpgv \
+ && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz /src/
+ADD https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz.sig /src/
+# The libjpeg-turbo Project's signing key, fingerprint 0338 C8D8 D9FD A62C F9C4 21BD 7EC2 DBB6 F4DB F434
+COPY keys/libjpeg-turbo.gpg /tmp/libjpeg-turbo.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/libjpeg-turbo.gpg "libjpeg-turbo-${VERSION}.tar.gz.sig" "libjpeg-turbo-${VERSION}.tar.gz"; \
+    mkdir libjpeg-turbo; \
+    tar -xzf "libjpeg-turbo-${VERSION}.tar.gz" -C libjpeg-turbo --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base. nasm assembles the x86-64 SIMD code; on arm64 the
+# SIMD code is written with compiler intrinsics.
+RUN dpkg-query -W -f '${Package}\n' | sort -u > /tmp/base-packages \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      nasm \
+      ninja-build \
+      zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/libjpeg-turbo /src/libjpeg-turbo
+WORKDIR /src/libjpeg-turbo
+ARG JOBS
+# The tools are linked statically against the libjpeg and TurboJPEG libraries
+# built here, so they never load the distro's older libjpeg. The prefix is
+# needed because upstream defaults to /opt/libjpeg-turbo. The tools print a
+# build date, taken from the release's files so that every build of a release
+# prints the same one. Upstream does not test on musl or on Linux arm64, so
+# the whole regression suite runs before anything is installed.
+RUN set -eu; \
+    SOURCE_DATE_EPOCH="$(stat -c %Y CMakeLists.txt)"; \
+    export SOURCE_DATE_EPOCH; \
+    set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DENABLE_SHARED=OFF \
+      -DENABLE_STATIC=ON \
+      -DREQUIRE_SIMD=ON \
+      -DWITH_SYSTEM_ZLIB=ON \
+      -DWITH_TESTS=ON \
+      -DWITH_TOOLS=ON \
+      -DWITH_TURBOJPEG=ON; \
+    cmake -S . -B build "$@" | tee /tmp/cmake.log; \
+    printf '%s\n' "$*" > /tmp/cmake-options; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    ctest --test-dir build --output-on-failure -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install build --component bin; \
+    test ! -e /out/usr/local/lib; \
+    test ! -e /out/usr/local/include; \
+    strip --strip-unneeded /out/usr/local/bin/*
+
+ARG BASE_IMAGE
+ARG VERSION
+# The tools may only load libc, libm and zlib; zlib proves that the distro's
+# zlib is used instead of the copy in the tarball.
+# runtime-deps lists the packages that own the libraries the tools load,
+# minus the base image's packages, plus the packages in runtime-deps.ubuntu.
+# libc and zlib are part of the base image, so it is usually empty.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    bin=/out/usr/local/bin; \
+    for tool in cjpeg djpeg jpegtran rdjpgcom tjbench wrjpgcom; do test -x "$bin/$tool"; done; \
+    "$bin/cjpeg" -version 2> /tmp/cjpeg-version; \
+    grep -Fq "libjpeg-turbo version ${VERSION} (build " /tmp/cjpeg-version; \
+    for f in "$bin"/*; do readelf -d "$f"; done \
+      | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p' | sort -u > /tmp/needed; \
+    if grep -Fvx -e libc.so.6 -e libm.so.6 -e libz.so.1 /tmp/needed; then \
+      echo "the tools load more than libc, libm and zlib" >&2; \
+      exit 1; \
+    fi; \
+    grep -Fqx libz.so.1 /tmp/needed; \
+    meta=/out/usr/local/share/randomcontainers/libjpeg-turbo; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.md README.ijg src/spng/libpng-LICENSE.txt "$meta/licenses/"; \
+    cp src/spng/LICENSE "$meta/licenses/spng-LICENSE"; \
+    awk '{ print } /\*\// { exit }' simd/jsimd.h > "$meta/licenses/simd-NOTICE"; \
+    grep -q 'Permission is granted to anyone' "$meta/licenses/simd-NOTICE"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz" \
+      "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${VERSION}/libjpeg-turbo-${VERSION}.tar.gz.sig" \
+      "https://github.com/randomcontainers/libjpeg-turbo/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "cmake: $(cmake --version | head -n 1)"; \
+      echo "options: $(cat /tmp/cmake-options)"; \
+      sed -n 's/^-- \(SIMD extensions: .*\)$/\1/p' /tmp/cmake.log; \
+      cat /tmp/cjpeg-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f -perm -u+x -print0 | xargs -0 ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/libjpeg-turbo/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "jpegtran"]
+CMD ["-version"]
