@@ -1,0 +1,270 @@
+name: libjpeg-turbo
+title: libjpeg-turbo
+summary: jpegtran rotates, crops and optimizes JPEG files without recompressing them, and cjpeg and djpeg convert JPEG to and from PNG, BMP, GIF, PPM and Targa.
+homepage: https://libjpeg-turbo.org/
+# The libjpeg code is under the IJG license and the TurboJPEG code under
+# BSD-3-Clause. The SIMD code is under the zlib license, and the libspng code
+# that cjpeg and djpeg use for PNG files under BSD-2-Clause and libpng-2.0.
+# The tools link the distro's zlib, not the copy in the tarball.
+license: IJG AND BSD-3-Clause AND Zlib AND BSD-2-Clause AND libpng-2.0
+source-release: true
+upstream:
+  source: github-release
+  repository: libjpeg-turbo/libjpeg-turbo
+  # Release tags are bare versions such as 3.2.0, now and then with a fourth
+  # number (3.1.4.1). Pre-releases use a third number of 80 or more: 3.1.90 is
+  # the first 3.2 beta.
+  tag-pattern: '^(\d+\.\d+\.(?:[0-7]?\d)(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: loose
+  version: 3.2.0
+  artifact:
+    url: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/{version}/libjpeg-turbo-{version}.tar.gz
+    signature: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/{version}/libjpeg-turbo-{version}.tar.gz.sig
+    sha256: 6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e
+image:
+  entrypoint: [jpegtran]
+  cmd: [-version]
+test:
+  - |
+    # The tools print their version to stderr.
+    for tool in cjpeg djpeg jpegtran; do
+      if ! "$tool" -version 2> "$tool-version.txt"; then
+        echo "$tool -version failed:" >&2
+        cat "$tool-version.txt" >&2
+        exit 1
+      fi
+      if ! grep -Fq "libjpeg-turbo version $VERSION (build " "$tool-version.txt"; then
+        echo "expected $tool to report libjpeg-turbo version $VERSION, got:" >&2
+        cat "$tool-version.txt" >&2
+        exit 1
+      fi
+    done
+  - |
+    # A 32x16 image, compressed with 4:2:0 subsampling into two whole 16x16
+    # blocks, so every rotation is lossless.
+    awk 'BEGIN {
+      print "P3 32 16 255"
+      for (y = 0; y < 16; y++)
+        for (x = 0; x < 32; x++) {
+          r = (x * 8 + y) % 256
+          b = (x * y * 3) % 256
+          print r, y * 16, b
+        }
+    }' > image.ppm
+    cjpeg -quality 90 -sample 2x2 -outfile image.jpg image.ppm
+    rdjpgcom -verbose image.jpg > image.txt
+    if ! grep -Fqx 'JPEG image is 32w * 16h, 3 color components, 8 bits per sample' image.txt; then
+      echo "expected cjpeg to write a 32x16 color image, got:" >&2
+      cat image.txt >&2
+      exit 1
+    fi
+    djpeg -pnm -outfile image-pixels.ppm image.jpg
+    cp image.jpg turn0.jpg
+    for i in 1 2 3 4; do
+      jpegtran -rotate 90 -perfect -outfile "turn$i.jpg" "turn$((i - 1)).jpg"
+    done
+    rdjpgcom -verbose turn1.jpg > turn1.txt
+    if ! grep -Fqx 'JPEG image is 16w * 32h, 3 color components, 8 bits per sample' turn1.txt; then
+      echo "expected a 16x32 image after one rotation, got:" >&2
+      cat turn1.txt >&2
+      exit 1
+    fi
+    djpeg -pnm -outfile turn4-pixels.ppm turn4.jpg
+    if ! cmp image-pixels.ppm turn4-pixels.ppm; then
+      echo "four rotations by 90 degrees changed the pixels" >&2
+      exit 1
+    fi
+    # At a width of 30 the right edge is a partial block, which -perfect
+    # refuses to move.
+    awk 'BEGIN { print "P3 30 16 255"; for (i = 0; i < 30 * 16; i++) print i % 256, 128, 64 }' > narrow.ppm
+    cjpeg -quality 90 -sample 2x2 -outfile narrow.jpg narrow.ppm
+    if jpegtran -rotate 270 -perfect -outfile narrow-turned.jpg narrow.jpg 2> perfect.txt; then
+      echo "jpegtran -perfect rotated an image with a partial block" >&2
+      exit 1
+    fi
+    if ! grep -Fq 'transformation is not perfect' perfect.txt; then
+      echo "expected jpegtran -perfect to say the transformation is not perfect, got:" >&2
+      cat perfect.txt >&2
+      exit 1
+    fi
+  - |
+    # image.jpg and image-pixels.ppm are from the previous test.
+    wrjpgcom -comment 'libjpeg-turbo test' image.jpg > commented.jpg
+    rdjpgcom commented.jpg > comment.txt
+    if [ "$(cat comment.txt)" != 'libjpeg-turbo test' ]; then
+      echo "expected the comment 'libjpeg-turbo test', got:" >&2
+      cat comment.txt >&2
+      exit 1
+    fi
+    # jpegtran copies comments by default and drops them with -copy none.
+    jpegtran -outfile copied.jpg commented.jpg
+    rdjpgcom copied.jpg > copied.txt
+    if [ "$(cat copied.txt)" != 'libjpeg-turbo test' ]; then
+      echo "expected jpegtran to keep the comment 'libjpeg-turbo test', got:" >&2
+      cat copied.txt >&2
+      exit 1
+    fi
+    jpegtran -copy none -optimize -progressive -outfile stripped.jpg commented.jpg
+    rdjpgcom -verbose stripped.jpg > stripped.txt
+    printf '%s\n' 'JPEG image is 32w * 16h, 3 color components, 8 bits per sample' 'JPEG process: Progressive' > expected.txt
+    if ! cmp -s expected.txt stripped.txt; then
+      echo "expected a progressive JPEG without comments, rdjpgcom printed:" >&2
+      cat stripped.txt >&2
+      exit 1
+    fi
+    djpeg -pnm -outfile stripped-pixels.ppm stripped.jpg
+    if ! cmp image-pixels.ppm stripped-pixels.ppm; then
+      echo "-copy none -optimize -progressive changed the pixels" >&2
+      exit 1
+    fi
+  - |
+    # image.jpg and image-pixels.ppm are from the second test.
+    djpeg -png -outfile image.png image.jpg
+    printf '\211PNG\r\n\032\n' > png-signature
+    head -c 8 image.png > image-signature
+    if ! cmp -s png-signature image-signature; then
+      echo "djpeg -png did not write a PNG signature, the file starts with:" >&2
+      od -c image-signature >&2
+      exit 1
+    fi
+    # A lossless JPEG keeps the pixels of the PNG exactly.
+    cjpeg -lossless 1 -outfile from-png.jpg image.png
+    rdjpgcom -verbose from-png.jpg > from-png.txt
+    if ! grep -Fqx 'JPEG process: Lossless' from-png.txt; then
+      echo "expected cjpeg -lossless 1 to write a lossless JPEG, rdjpgcom printed:" >&2
+      cat from-png.txt >&2
+      exit 1
+    fi
+    djpeg -pnm -outfile from-png.ppm from-png.jpg
+    if ! cmp image-pixels.ppm from-png.ppm; then
+      echo "the PNG written by djpeg and read by cjpeg has other pixels" >&2
+      exit 1
+    fi
+    cjpeg -quality 85 -outfile lossy.jpg image.png
+    rdjpgcom -verbose lossy.jpg > lossy.txt
+    if ! grep -Fqx 'JPEG image is 32w * 16h, 3 color components, 8 bits per sample' lossy.txt; then
+      echo "expected cjpeg to write a 32x16 color image from the PNG, got:" >&2
+      cat lossy.txt >&2
+      exit 1
+    fi
+  - |
+    printf 'not a JPEG file\n' > garbage.jpg
+    for tool in djpeg jpegtran; do
+      if "$tool" -outfile "garbage-$tool.out" garbage.jpg 2> "garbage-$tool.txt"; then
+        echo "$tool accepted a file that is not a JPEG" >&2
+        exit 1
+      fi
+      if ! grep -Fq 'Not a JPEG file' "garbage-$tool.txt"; then
+        echo "unexpected error from $tool:" >&2
+        cat "garbage-$tool.txt" >&2
+        exit 1
+      fi
+    done
+    if cjpeg -outfile garbage-cjpeg.out garbage.jpg 2> garbage-cjpeg.txt; then
+      echo "cjpeg accepted an input file in an unknown format" >&2
+      exit 1
+    fi
+    if ! grep -Fq 'Unrecognized input file format' garbage-cjpeg.txt; then
+      echo "unexpected error from cjpeg:" >&2
+      cat garbage-cjpeg.txt >&2
+      exit 1
+    fi
+    # -nooverwrite leaves an existing output file alone. image.jpg is from
+    # the second test.
+    printf 'keep\n' > existing.jpg
+    if jpegtran -nooverwrite -outfile existing.jpg image.jpg 2> nooverwrite.txt; then
+      echo "jpegtran -nooverwrite replaced an existing file" >&2
+      exit 1
+    fi
+    if [ "$(cat existing.jpg)" != keep ]; then
+      echo "jpegtran -nooverwrite changed the existing file" >&2
+      exit 1
+    fi
+    if ! grep -Fq 'file exists' nooverwrite.txt; then
+      echo "expected jpegtran -nooverwrite to say the file exists, got:" >&2
+      cat nooverwrite.txt >&2
+      exit 1
+    fi
+  - |
+    # The tools are linked statically against this libjpeg-turbo: they never
+    # load a distro libjpeg, and the image has no libjpeg of its own.
+    if find /usr/local -name 'lib*jpeg*.so*' | grep .; then
+      echo "found shared libjpeg files under /usr/local" >&2
+      exit 1
+    fi
+    for tool in cjpeg djpeg jpegtran tjbench; do
+      ldd "/usr/local/bin/$tool" > "ldd-$tool.txt"
+      if grep -i jpeg "ldd-$tool.txt" >&2; then
+        echo "$tool loads a shared libjpeg" >&2
+        exit 1
+      fi
+    done
+    # tjbench uses the TurboJPEG API and prints its errors to standard output.
+    # It exits with 0 even when a benchmark fails, so its output is checked
+    # too: the frame rate line comes only after the decompression loop has
+    # finished. image.jpg is from the second test.
+    if ! tjbench image.jpg -benchtime 0.01 -warmup 0 -nowrite > tjbench.txt; then
+      echo "tjbench failed:" >&2
+      cat tjbench.txt >&2
+      exit 1
+    fi
+    if grep -q ERROR tjbench.txt || ! grep -Fq 'Image size: 32 x 16' tjbench.txt \
+      || ! grep -q 'Decompress  *--> Frame rate' tjbench.txt; then
+      echo "tjbench did not decompress image.jpg:" >&2
+      cat tjbench.txt >&2
+      exit 1
+    fi
+examples:
+  - title: Rotate a photo by 90 degrees without recompressing it
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libjpeg-turbo -rotate 90 -copy all -outfile rotated.jpg photo.jpg
+  - title: Remove all metadata and make a smaller progressive JPEG with the same pixels
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libjpeg-turbo -copy none -optimize -progressive -outfile small.jpg photo.jpg
+  - title: Crop a photo to 1200x800 pixels from its top left corner without recompressing it
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libjpeg-turbo -crop 1200x800+0+0 -copy all -outfile cropped.jpg photo.jpg
+  - title: Convert a PNG to a JPEG at quality 85
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint cjpeg ghcr.io/randomcontainers/libjpeg-turbo -quality 85 -outfile photo.jpg photo.png
+  - title: Turn a photo upright and reset its Exif orientation (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/libjpeg-turbo -c 'jpegtran -rotate 90 -copy all -outfile upright.jpg photo.jpg && exiftool -overwrite_original -n -Orientation=1 upright.jpg'
+combos:
+  - with: [exiftool]
+    default: true
+    base: libjpeg-turbo
+    summary: libjpeg-turbo's jpegtran, cjpeg and djpeg with ExifTool, for turning photos upright losslessly and then resetting their Exif orientation.
+    test:
+      - |
+        awk 'BEGIN {
+          print "P3 32 16 255"
+          for (y = 0; y < 16; y++)
+            for (x = 0; x < 32; x++)
+              print x * 8, y * 16, 96
+        }' > photo.ppm
+        cjpeg -quality 90 -sample 2x2 -outfile photo.jpg photo.ppm
+        # A camera held sideways records Orientation 6 (rotate 90 degrees
+        # clockwise to display) and leaves the pixels as they are.
+        exiftool -q -overwrite_original -n -Orientation=6 photo.jpg
+        orientation="$(exiftool -s3 -n -Orientation photo.jpg)"
+        if [ "$orientation" != 6 ]; then
+          echo "expected Orientation 6 after setting it, got '$orientation'" >&2
+          exit 1
+        fi
+        jpegtran -rotate 90 -perfect -copy all -outfile upright.jpg photo.jpg
+        # -copy all keeps the Exif data, so the tag still says 6 until it is reset.
+        orientation="$(exiftool -s3 -n -Orientation upright.jpg)"
+        if [ "$orientation" != 6 ]; then
+          echo "expected jpegtran -copy all to keep Orientation 6, got '$orientation'" >&2
+          exit 1
+        fi
+        exiftool -q -overwrite_original -n -Orientation=1 upright.jpg
+        size="$(exiftool -s3 -ImageSize upright.jpg)"
+        orientation="$(exiftool -s3 -n -Orientation upright.jpg)"
+        if [ "$size" != 16x32 ] || [ "$orientation" != 1 ]; then
+          echo "expected a 16x32 image with Orientation 1, got $size with Orientation $orientation" >&2
+          exit 1
+        fi
+        djpeg -pnm -outfile upright.ppm upright.jpg
+        dimensions="$(head -n 2 upright.ppm | tail -n 1)"
+        if [ "$dimensions" != '16 32' ]; then
+          echo "expected djpeg to write a 16x32 image, got the header line '$dimensions'" >&2
+          exit 1
+        fi
