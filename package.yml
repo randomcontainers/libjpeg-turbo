@@ -17,11 +17,11 @@ upstream:
   tag-pattern: '^(\d+\.\d+\.(?:[0-7]?\d)(?:\.\d+)?)$'
   version-template: '{1}'
   versioning: loose
-  version: 3.2.0
+  version: 3.2.1
   artifact:
     url: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/{version}/libjpeg-turbo-{version}.tar.gz
     signature: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/{version}/libjpeg-turbo-{version}.tar.gz.sig
-    sha256: 6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e
+    sha256: c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
 image:
   entrypoint: [jpegtran]
   cmd: [-version]
